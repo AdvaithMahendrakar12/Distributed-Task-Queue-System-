@@ -36,8 +36,26 @@ const processJob = async (job: VideoJob) => {
 
 const startWorker = async () => {
     await createWorkerGroup();
+    console.log(`Worker ${CONSUMER_NAME} started`);
     while (true) {
-
+        const messages = await redis.xreadgroup(
+            'GROUP',
+            GROUP_NAME,
+            CONSUMER_NAME,
+            'COUNT', // read only 1 message at a time
+            1, //number of messages to read
+            'BLOCK',
+            0, //block for 0 seconds
+            'STREAMS',
+            STREAM_NAME,
+            '>' //read from the last unread message
+        );
+        if (!messages || !Array.isArray(messages)) continue;
+        for (const [key, message] of messages as [string, [string, string[]][]][]) {
+            const [messageId, fields] = message[0];
+            const job = JSON.parse(fields[1]) as VideoJob;
+            processJob(job);
+        }
     }
 }
 
