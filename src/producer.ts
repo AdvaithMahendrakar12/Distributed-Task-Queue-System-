@@ -1,8 +1,21 @@
-import { redis } from './index';
+import { redis, prisma } from './index';
 import { VideoJob } from './types';
 
 
 const enqueueJob = async (job: VideoJob) => {
+
+    await prisma.job.create({
+        data: {
+            id: job.id,
+            type: job.type,
+            payload: job.payload,
+            status: 'pending',
+            retryCount: 0,
+            createdAt: new Date(job.createdAt),
+        }
+    });
+    console.log(`Job ${job.id} saved to DB with status 'pending'`);
+
     const entryId = await redis.xadd(
         'video-queue',  // stream name
         '*',            // auto-generate ID (timestamp-based)
@@ -11,7 +24,7 @@ const enqueueJob = async (job: VideoJob) => {
     console.log(`Job ${job.id} enqueued with stream entry ID: ${entryId}`);
 }
 
-const assignjob = () => {
+const assignjob = (): VideoJob => {
     const job: VideoJob = {
         id: crypto.randomUUID(),
         type: 'process_video',
@@ -23,6 +36,7 @@ const assignjob = () => {
         },
         createdAt: new Date().toISOString(),
         status: 'pending',
+        retryCount: 0,
     };
 
     return job;
@@ -30,5 +44,6 @@ const assignjob = () => {
 
 (async () => {
     await enqueueJob(assignjob());
+    await prisma.$disconnect();
     await redis.quit();
 })();

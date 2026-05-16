@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import { VideoJob } from './types';
-import { redis } from '.';
-import { resolve } from 'node:dns';
+import { redis, prisma } from '.';
 
 
 
@@ -40,6 +39,7 @@ const processJob = async (job: VideoJob) => {
 
 
 const startWorker = async () => {
+
     await createWorkerGroup();
     console.log(`Worker ${CONSUMER_NAME} started`);
     while (true) {
@@ -59,14 +59,46 @@ const startWorker = async () => {
         for (const [key, message] of messages as [string, [string, string[]][]][]) {
             const [messageId, fields] = message[0];
             const job = JSON.parse(fields[1]) as VideoJob;
-            await processJob(job); // process the job
-            await redis.xack(STREAM_NAME, GROUP_NAME, messageId); // acknowledge the job
+
+            try {
+                // Update DB status to 'processing' before starting work
+                await prisma.job.update({
+                    where: { id: job.id },
+                    data: {
+                        status: 'processing',
+                        workerId: CONSUMER_NAME,
+                        startedAt: new Date(),
+                    }
+                });
+
+                await processJob(job); // process the job
+                await redis.xack(STREAM_NAME, GROUP_NAME, messageId); // acknowledge the job
+
+                await prisma.job.update({
+                    where: { id: job.id },
+                    data: {
+                        status: 'completed',
+                        completedAt: new Date(),
+                    }
+                });
+                console.log(`Job ${job.id} completed and updated in DB`);
+            } catch (error) {
+                console.error(`Job ${job.id} failed:`, error);
+                await prisma.job.update({
+                    where: { id: job.id },
+                    data: {
+                        status: 'failed',
+                        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+                        retryCount: { increment: 1 }
+                    }
+                });
+                await redis.xack(STREAM_NAME, GROUP_NAME, messageId); 
+            }
         }
     }
+
+
+
 }
 
 startWorker();
-
-
-//what if t
-

@@ -14,8 +14,9 @@ export type VideoJob = {
     }
     createdAt: string
     status: 'pending' | 'processing' | 'completed' | 'failed'
+    workerId?: string
+    retryCount: number
+    errorMessage?: string
+    startedAt?: string
+    completedAt?: string
 }
-
-
-
-
