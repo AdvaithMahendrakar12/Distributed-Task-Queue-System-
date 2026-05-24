@@ -1,0 +1,241 @@
+syntax = "proto3";
+
+package taskqueue;
+
+option go_package = "github.com/AdvaithMahendrakar12/distributed-task-queue-system/proto";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// Job lifecycle states — mirrors the TypeScript status union
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_PENDING     = 1;
+  JOB_STATUS_PROCESSING  = 2;
+  JOB_STATUS_COMPLETED   = 3;
+  JOB_STATUS_FAILED      = 4;
+  JOB_STATUS_CANCELLED   = 5;
+}
+
+// Target resolution for video transcoding
+enum Resolution {
+  RESOLUTION_UNSPECIFIED = 0;
+  RESOLUTION_720P        = 1;
+  RESOLUTION_1080P       = 2;
+}
+
+// Output container format
+enum OutputFormat {
+  OUTPUT_FORMAT_UNSPECIFIED = 0;
+  OUTPUT_FORMAT_MP4         = 1;
+  OUTPUT_FORMAT_WEBM        = 2;
+}
+
+// ============================================================================
+// MESSAGES — Job Domain
+// ============================================================================
+
+// The video processing payload — maps to VideoJob.payload in types.ts
+message VideoPayload {
+  string      video_id      = 1;
+  string      video_url     = 2;
+  Resolution  resolution    = 3;
+  OutputFormat output_format = 4;
+}
+
+// Full job record — mirrors the Prisma Job model and VideoJob type
+message Job {
+  string                    id            = 1;
+  string                    type          = 2;  // e.g. "process_video"
+  VideoPayload              payload       = 3;
+  JobStatus                 status        = 4;
+  string                    worker_id     = 5;  // consumer name (e.g. "worker-12345")
+  int32                     retry_count   = 6;
+  string                    error_message = 7;
+  google.protobuf.Timestamp created_at    = 8;
+  google.protobuf.Timestamp started_at    = 9;
+  google.protobuf.Timestamp completed_at  = 10;
+}
+
+// ============================================================================
+// JobService — Client / Producer-Facing API
+// ============================================================================
+//
+// This is the "front door" of the queue system.
+// Clients call SubmitJob to enqueue work, then poll or query status.
+//
+//   Client (REST/gRPC) ──→ JobService ──→ Redis Stream + Postgres
+//
+
+service JobService {
+  // Enqueue a new video processing job.
+  // The service creates a DB record (status=PENDING), publishes to the
+  // Redis stream, and returns the created job with its UUID.
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+
+  // Retrieve a single job by ID (status, worker assignment, timestamps).
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+
+  // List jobs with optional filters (by status, pagination).
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+
+  // Cancel a pending job before a worker picks it up.
+  // Returns FAILED_PRECONDITION if the job is already processing/completed.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+}
+
+// ── SubmitJob ───────────────────────────────────────────────────────────────
+
+message SubmitJobRequest {
+  string       type    = 1;  // job type, e.g. "process_video"
+  VideoPayload payload = 2;  // the video transcoding parameters
+}
+
+message SubmitJobResponse {
+  Job    job      = 1;  // the created job (status=PENDING, UUID assigned)
+  string entry_id = 2;  // Redis stream entry ID (e.g. "1711900000000-0")
+}
+
+// ── GetJob ──────────────────────────────────────────────────────────────────
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  Job job = 1;
+}
+
+// ── ListJobs ────────────────────────────────────────────────────────────────
+
+message ListJobsRequest {
+  JobStatus status    = 1;  // optional filter — 0 (UNSPECIFIED) = all statuses
+  int32     page_size = 2;  // max results per page (default: 20, max: 100)
+  string    page_token = 3; // opaque cursor for pagination
+}
+
+message ListJobsResponse {
+  repeated Job jobs            = 1;
+  string       next_page_token = 2;  // empty if no more results
+  int32        total_count     = 3;  // total matching jobs (for UI display)
+}
+
+// ── CancelJob ───────────────────────────────────────────────────────────────
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {
+  Job job = 1;  // updated job with status=CANCELLED
+}
+
+// ============================================================================
+// WorkerService — Worker-Facing API
+// ============================================================================
+//
+// Workers connect to this service to register themselves, receive job
+// assignments via server-streaming, report heartbeats, and submit results.
+//
+//   Worker ──→ WorkerService ──→ Redis Stream (XREADGROUP) + Postgres
+//
+
+service WorkerService {
+  // Register a worker instance. Returns a unique worker ID and config.
+  // Called once on worker startup before requesting jobs.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Server-streaming RPC — the worker opens a long-lived stream and the
+  // server pushes job assignments as they arrive from the Redis stream.
+  // This replaces the XREADGROUP polling loop in workers.ts.
+  rpc StreamJobs(StreamJobsRequest) returns (stream JobAssignment);
+
+  // Worker periodically sends heartbeats to prove liveness.
+  // If heartbeats stop, the server can reclaim the worker's pending jobs
+  // (equivalent to the XAUTOCLAIM logic in workers.ts).
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Report the result of a processed job (success or failure).
+  // On success: sets status=COMPLETED, records completedAt.
+  // On failure: sets status=FAILED, records errorMessage, increments retryCount.
+  rpc ReportJobResult(ReportJobResultRequest) returns (ReportJobResultResponse);
+
+  // Deregister a worker during graceful shutdown.
+  // The server reclaims any pending jobs assigned to this worker.
+  rpc DeregisterWorker(DeregisterWorkerRequest) returns (google.protobuf.Empty);
+}
+
+// ── RegisterWorker ──────────────────────────────────────────────────────────
+
+message RegisterWorkerRequest {
+  string worker_name = 1;  // human-readable name (e.g. "worker-12345")
+  map<string, string> labels = 2;  // optional metadata (hostname, region, etc.)
+}
+
+message RegisterWorkerResponse {
+  string worker_id      = 1;  // server-assigned unique worker ID
+  string consumer_group = 2;  // Redis consumer group to join (e.g. "video-workers")
+  string stream_name    = 3;  // Redis stream name (e.g. "video-queue")
+}
+
+// ── StreamJobs ──────────────────────────────────────────────────────────────
+
+message StreamJobsRequest {
+  string worker_id     = 1;  // the registered worker ID
+  int32  max_in_flight = 2;  // max concurrent jobs this worker can handle (default: 1)
+}
+
+// A single job pushed to the worker via the server stream
+message JobAssignment {
+  string stream_entry_id = 1;  // Redis stream message ID (needed for XACK)
+  Job    job             = 2;  // the full job to process
+}
+
+// ── Heartbeat ───────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {
+  string worker_id        = 1;
+  int32  active_job_count = 2;  // how many jobs the worker is currently processing
+}
+
+message HeartbeatResponse {
+  bool   acknowledged     = 1;
+  int64  heartbeat_interval_ms = 2;  // server-recommended interval (e.g. 10000ms)
+}
+
+// ── ReportJobResult ─────────────────────────────────────────────────────────
+
+message ReportJobResultRequest {
+  string worker_id       = 1;
+  string job_id          = 2;
+  string stream_entry_id = 3;  // so the server can XACK
+
+  oneof result {
+    JobSuccess success = 4;
+    JobFailure failure = 5;
+  }
+}
+
+message JobSuccess {
+  string output_url = 1;  // URL to the transcoded video (optional)
+  map<string, string> metadata = 2;  // any processing metadata
+}
+
+message JobFailure {
+  string error_message = 1;
+  bool   retryable     = 2;  // hint: should the server re-enqueue this job?
+}
+
+message ReportJobResultResponse {
+  Job job = 1;  // the updated job record
+}
+
+// ── DeregisterWorker ────────────────────────────────────────────────────────
+
+message DeregisterWorkerRequest {
+  string worker_id = 1;
+}
