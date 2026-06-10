@@ -1,6 +1,18 @@
 import 'dotenv/config';
 import { VideoJob } from './types';
 import { redis, prisma } from '.';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+// Initialize gRPC Client
+const packageDef = protoLoader.loadSync('./src/proto/job.proto');
+const grpcObject = grpc.loadPackageDefinition(packageDef);
+const taskqueue = (grpcObject as any).taskqueue;
+
+const client = new taskqueue.JobService(
+    'localhost:50051',
+    grpc.credentials.createInsecure()
+);
 
 
 
@@ -44,29 +56,26 @@ const handleJob = async (messageId: string, job: VideoJob) => {
                 startedAt: new Date(),
             }
         });
-        console.log(`  → DB updated to 'processing'`);
+        console.log(`DB updated to 'processing'`);
 
         await processJob(job);
         await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
-
-        await prisma.job.update({
-            where: { id: job.id },
-            data: {
-                status: 'completed',
-                completedAt: new Date(),
-            }
-        });
-        console.log(`  → Job ${job.id} completed and DB updated to 'completed'`);
+        client.reportJobResult({ 
+            jobId: job.id, 
+            status: 'completed',
+            errorMessage: ''
+        }, (err: any, response: any) => {
+            console.log('Result reported:', response)
+        })
     } catch (error) {
-        console.error(`  → Job ${job.id} failed:`, error);
-        await prisma.job.update({
-            where: { id: job.id },
-            data: {
-                status: 'failed',
-                errorMessage: error instanceof Error ? error.message : 'Unknown error',
-                retryCount: { increment: 1 }
-            }
-        });
+        console.error(`Job ${job.id} failed:`, error);
+     client.reportJobResult({
+            jobId: job.id,
+            status: 'failed',
+            errorMessage: error instanceof Error ? error.message : 'Unknown error'
+        }, (err: any, response: any) => {
+            console.log('Failure reported:', response)
+        })
         await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
     }
 }

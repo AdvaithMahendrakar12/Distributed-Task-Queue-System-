@@ -43,14 +43,28 @@ const submitJob = async (call: any, callback: any) => {
         );
         console.log(`Job ${job.id} enqueued with stream entry ID: ${entryId}`);
           callback(null, {
-            jobId: crypto.randomUUID(),
+            jobId: job.id,
             status: 'pending'
         })
     
 }
 
+
+const reportJobResult = async (call: any, callback: any) => {
+    const { jobId, status, errorMessage } = call.request
+    
+    await prisma.job.update({
+        where: { id: jobId },
+        data: {
+            status: status,  // whatever worker reported
+            completedAt: status === 'completed' ? new Date() : null,
+            errorMessage: errorMessage || null,
+        }
+    })
+    callback(null, { jobId, status })
+}
 const server = new grpc.Server()
-server.addService(taskqueue.JobService.service, { submitJob })
+server.addService(taskqueue.JobService.service, { submitJob, reportJobResult })
 server.bindAsync('0.0.0.0:50051', grpc.ServerCredentials.createInsecure(), () => {
     console.log('gRPC server running on port 50051')
 })

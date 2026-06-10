@@ -5,8 +5,8 @@ package taskqueue;
 
 service JobService{ 
     rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+    rpc ReportJobResult(ReportJobResultRequest) returns (ReportJobResultResponse); 
 }
-
 
 message SubmitJobRequest {
   string video_id  = 1;
@@ -14,6 +14,17 @@ message SubmitJobRequest {
 }
 
 message SubmitJobResponse {
+  string job_id = 1;
+  string status = 2;
+}
+
+message ReportJobResultRequest {
+  string job_id = 1;
+  string status = 2;
+  string error_message = 3;
+}
+
+message ReportJobResultResponse {
   string job_id = 1;
   string status = 2;
 }
