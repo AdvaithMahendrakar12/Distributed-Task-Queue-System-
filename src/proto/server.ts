@@ -57,7 +57,8 @@ const reportJobResult = async (call: any, callback: any) => {
         where: { id: jobId },
         data: {
             status: status,  // whatever worker reported
-            completedAt: status === 'completed' ? new Date() : null,
+            startedAt: status === 'processing' ? new Date() : undefined,
+            completedAt: status === 'completed' ? new Date() : undefined,
             errorMessage: errorMessage || null,
         }
     })

@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { VideoJob } from './types';
-import { redis, prisma } from '.';
+import { redis } from '.';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -44,19 +44,17 @@ const processJob = async (job: VideoJob) => {
     }
 }
 
-// Handle a single job: update DB to processing → process → ack → update DB to completed
 const handleJob = async (messageId: string, job: VideoJob) => {
     try {
-        // Update DB status to 'processing' before starting work
-        await prisma.job.update({
-            where: { id: job.id },
-            data: {
-                status: 'processing',
-                workerId: CONSUMER_NAME,
-                startedAt: new Date(),
-            }
+
+        client.reportJobResult({ 
+            jobId: job.id, 
+            status: 'processing',
+            errorMessage: ''
+        }, (err: any, response: any) => {
+            if (err) console.error('Error reporting processing status:', err);
+            else console.log('Job status updated to processing');
         });
-        console.log(`DB updated to 'processing'`);
 
         await processJob(job);
         await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
