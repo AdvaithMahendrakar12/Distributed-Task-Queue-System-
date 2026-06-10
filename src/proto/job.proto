@@ -1,5 +1,7 @@
 
-syntax = proto
+syntax = "proto3";
+
+package taskqueue;
 
 service JobService{ 
     rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);

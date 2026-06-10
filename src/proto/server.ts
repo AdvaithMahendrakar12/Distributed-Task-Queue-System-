@@ -5,7 +5,7 @@ import { prisma, redis } from '..'
 import { VideoJob } from '../types'
 
 // 1. Load your proto file
-const packageDef = protoLoader.loadSync('proto/job.proto')
+const packageDef = protoLoader.loadSync('./src/proto/job.proto')
 const grpcObject = grpc.loadPackageDefinition(packageDef)
 const taskqueue = (grpcObject as any).taskqueue
 
