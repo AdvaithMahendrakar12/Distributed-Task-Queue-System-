@@ -1,43 +1,50 @@
 # ⚡ Distributed Task Queue System
 
-A reliable, distributed task queue built with Redis Streams and consumer groups for at-least-once job delivery across multiple worker instances.
+A reliable, distributed task queue built with Redis Streams, consumer groups, and gRPC for at-least-once job delivery and status monitoring across multiple worker instances.
 
 ## Architecture
 
 ```
-┌──────────────┐     ┌─────────────────────┐
-│   Producer   │────▶│    Redis Streams     │
-│  (Job API)   │     │   (video-queue)      │
-└──────────────┘     └──────────┬───────────┘
-                                │
-                    XREADGROUP (competing consumers)
-                                │
-                    ┌───────────┼───────────┐
-                    │           │           │
-              ┌─────▼──┐ ┌─────▼──┐ ┌─────▼──┐
-              │Worker-1│ │Worker-2│ │Worker-3│
-              │ (PID)  │ │ (PID)  │ │ (PID)  │
-              └────┬───┘ └────┬───┘ └────┬───┘
-                   │          │          │
-                   └──────────┼──────────┘
-                              │ XACK
-                    ┌─────────▼──────────┐
-                    │  PostgreSQL (Prisma) │
-                    │  Job state & audit   │
-                    └────────────────────┘
+                  ┌──────────────────┐
+                  │   gRPC Client    │
+                  │ (SubmitJob RPC)  │
+                  └────────┬─────────┘
+                           │
+                           │ gRPC (Port 50051)
+                           ▼
+                  ┌──────────────────┐
+                  │   gRPC Server    │◀──────────────────────┐
+                  │(src/proto/server)│                       │
+                  └──────┬────┬──────┘                       │
+                         │    │                              │
+          Prisma (Save)  │    │ Redis (XADD)                 │ gRPC (ReportJobResult)
+                         ▼    ▼                              │
+                  ┌──────────┐ ┌─────────────────────┐       │
+                  │PostgreSQL│ │    Redis Streams    │       │
+                  │ Database │ │    (video-queue)    │       │
+                  └──────────┘ └──────────┬──────────┘       │
+                                          │                  │
+                              XREADGROUP  │                  │
+                                          ▼                  │
+                              ┌───────────────────────┐      │
+                              │     Worker Group      │      │
+                              │ (video-workers group) │      │
+                              │ ┌─────────┐ ┌─────────┐│      │
+                              │ │ Worker1 │ │ Worker2 │├──────┘
+                              │ └─────────┘ └─────────┘│
+                              └───────────────────────┘
 ```
 
 ## Features
 
-- **Redis Streams as Message Broker** — Durable, append-only log with automatic timestamp-based IDs via `XADD`
-- **Consumer Groups** — Fair work distribution using `XGROUP` / `XREADGROUP` with competing consumers
-- **At-Least-Once Delivery** — `XACK`-based acknowledgment ensures no message is lost, even during worker crashes
-- **Blocking Reads** — Workers use `BLOCK 0` for efficient, event-driven processing (zero polling waste)
-- **Typed Job Payloads** — TypeScript interfaces with Zod validation for type-safe job definitions
-- **Job Persistence** — Prisma ORM + PostgreSQL for durable job metadata and audit trails
-- **gRPC Ready** — Protocol Buffers for internal service-to-service communication
-- **Process-Level Isolation** — Each worker gets a unique consumer name (`worker-${PID}`) for independent scaling
-- **Docker Compose** — Single-command local development with Redis and PostgreSQL
+- **Redis Streams as Message Broker** — Durable, append-only log with automatic timestamp-based IDs via `XADD`.
+- **Consumer Groups** — Fair work distribution using `XGROUP` / `XREADGROUP` with competing consumers.
+- **At-Least-Once Delivery** — `XACK`-based acknowledgment ensures no message is lost, even during worker crashes.
+- **Blocking Reads** — Workers use `BLOCK 5000` for efficient, event-driven processing (zero polling waste).
+- **gRPC API Service** — Schema-enforced RPC boundaries with protocol buffers for submitting jobs (`SubmitJob`) and reporting worker statuses (`ReportJobResult`).
+- **Centralized Persistence** — Prisma ORM + PostgreSQL for durable job metadata and audit trails, decoupled from worker database dependencies.
+- **Process-Level Isolation** — Each worker gets a unique consumer name (`worker-${PID}`) for independent scaling.
+- **Docker Compose** — Single-command local development with Redis and PostgreSQL.
 
 ## Tech Stack
 
@@ -53,39 +60,96 @@ A reliable, distributed task queue built with Redis Streams and consumer groups 
 
 ## Quick Start
 
+### 1. Clone & Setup
+
 ```bash
 # Clone the repo
 git clone https://github.com/AdvaithMahendrakar12/Distributed-Task-Queue-System-.git
 cd Distributed-Task-Queue-System-
 
-# Start Redis
-docker-compose up -d
-
 # Install dependencies
 npm install
 
-# Terminal 1 — Start a worker (spawns with unique PID-based consumer name)
-npm run worker
-
-# Terminal 2 — Start another worker (for parallel processing)
-npm run worker
-
-# Terminal 3 — Submit a job
-npm run producer
+# Start Redis & PostgreSQL services
+docker-compose up -d
 ```
+
+### 2. Start Services
+
+To run the full gRPC-enabled system, you need to spin up the gRPC Server, the Worker processes, and a client/producer to submit jobs.
+
+```bash
+# Terminal 1 — Start the gRPC Server
+npm run grpc:server
+
+# Terminal 2 — Start worker 1
+npm run worker
+
+# Terminal 3 — Start worker 2 (to demonstrate parallel processing)
+npm run worker
+
+# Terminal 4 — Submit a job using the gRPC client
+npm run grpc:submit
+```
+
+*Note: You can still use the direct producer (`npm run producer`) to submit jobs directly to Redis and PostgreSQL, bypassing gRPC.*
 
 ### Expected Output
 
-**Producer:**
+**gRPC Server:**
 ```
+gRPC server running on port 50051
+Received job: { videoId: 'vid_001', videoUrl: 'https://example.com/video.mp4' }
+Job a1b2c3d4-... saved to DB with status 'pending'
 Job a1b2c3d4-... enqueued with stream entry ID: 1711900000000-0
 ```
 
 **Worker:**
 ```
 Worker group video-workers created
-Worker worker-12345 started
-Processing job a1b2c3d4-...
+Worker worker-23456 started
+Listening for jobs on 'video-queue'...
+
+[NEW] Picked up job a1b2c3d4-...
+Job status updated to processing
+Processing job a1b2c3d4-... (1080p - 10s)
+Result reported: { jobId: 'a1b2c3d4-...', status: 'completed' }
+```
+
+## gRPC API Design
+
+The RPC interface is defined in `src/proto/job.proto`:
+
+```protobuf
+syntax = "proto3";
+
+package taskqueue;
+
+service JobService { 
+    rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+    rpc ReportJobResult(ReportJobResultRequest) returns (ReportJobResultResponse); 
+}
+
+message SubmitJobRequest {
+  string video_id  = 1;
+  string video_url = 2;
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+  string status = 2;
+}
+
+message ReportJobResultRequest {
+  string job_id = 1;
+  string status = 2;
+  string error_message = 3;
+}
+
+message ReportJobResultResponse {
+  string job_id = 1;
+  string status = 2;
+}
 ```
 
 ## Job Schema
@@ -102,88 +166,80 @@ type VideoJob = {
   };
   createdAt: string;                              // ISO timestamp
   status: 'pending' | 'processing' | 'completed' | 'failed';
+  retryCount: number;
 };
-```
-
-## Job Lifecycle
-
-```
-         ┌─────────┐
-         │ pending  │  (XADD to stream)
-         └────┬─────┘
-              │
-         ┌────▼──────┐
-         │ processing │  (XREADGROUP by worker)
-         └────┬──────┘
-              │
-        ┌─────┴──────┐
-        │            │
-  ┌─────▼─────┐ ┌───▼────┐
-  │ completed │ │ failed │
-  │  (XACK)   │ │ (retry)│
-  └───────────┘ └────────┘
 ```
 
 ## How It Works
 
-### Producer
-1. Creates a typed `VideoJob` with a UUID, payload, and `pending` status
-2. Serializes the job as JSON and appends it to Redis Stream via `XADD video-queue * job <payload>`
-3. Redis auto-generates a timestamp-based entry ID for ordering
+### gRPC Server (`src/proto/server.ts`)
+1. Exposes a gRPC service listening on port `50051`.
+2. Implements `SubmitJob` which:
+   - Formulates a complete `VideoJob` payload.
+   - Saves the job to PostgreSQL via Prisma with a `pending` status.
+   - Pushes the job onto the Redis Stream (`video-queue`) via `XADD`.
+3. Implements `ReportJobResult` which:
+   - Updates the job status (`processing`, `completed`, `failed`) and timestamps (`startedAt`, `completedAt`) in PostgreSQL.
 
-### Worker
-1. Creates/joins a **consumer group** (`video-workers`) on the stream using `XGROUP CREATE`
-2. Enters an infinite loop, calling `XREADGROUP` with `BLOCK 0` — efficiently waits for new messages
-3. Each message is delivered to **exactly one consumer** in the group (competing consumer pattern)
-4. Processes the job (simulates 5s for 720p, 10s for 1080p transcoding)
-5. Acknowledges completion with `XACK` — removes the message from the pending entries list (PEL)
+### Worker (`src/workers.ts`)
+1. Joins the consumer group `video-workers` on startup.
+2. Periodically scans for stuck or stalled jobs using `XAUTOCLAIM`.
+3. Listens for new jobs using blocking read `XREADGROUP` (`BLOCK 5000`).
+4. When a job is picked up:
+   - Calls `ReportJobResult` via the gRPC client to mark the job as `processing`.
+   - Simulates video transcoding.
+   - On success: updates status to `completed` via gRPC and acknowledges with `XACK`.
+   - On failure: updates status to `failed` via gRPC with an error message and acknowledges with `XACK`.
 
-### Why Redis Streams over Pub/Sub?
-| Feature | Redis Pub/Sub | Redis Streams |
-|---------|-------------|--------------|
-| Message persistence | ❌ Fire-and-forget | ✅ Durable log |
-| Consumer groups | ❌ All subscribers get all messages | ✅ Competing consumers |
-| Acknowledgment | ❌ None | ✅ XACK |
-| Replay | ❌ Impossible | ✅ Read from any offset |
-| Delivery guarantee | At-most-once | At-least-once |
+### Client/Producer (`src/proto/client.ts`)
+1. Connects to `localhost:50051` over insecure credentials.
+2. Initiates the `SubmitJob` RPC request.
+
+---
 
 ## Project Structure
 
 ```
 distributed-task-queue-system/
 ├── src/
-│   ├── index.ts          # Redis connection setup
-│   ├── producer.ts       # Job creation & stream publishing
-│   ├── workers.ts        # Consumer group, blocking reads, job processing
-│   └── types.ts          # VideoJob type definition
+│   ├── index.ts          # Redis & Prisma client initializations
+│   ├── producer.ts       # Direct producer script (DB + Redis stream writer)
+│   ├── workers.ts        # Worker pool consumer with gRPC result reporting
+│   ├── types.ts          # Zod validation & TS type declarations
+│   ├── check-db.ts       # DB inspection utility script
+│   ├── cleanup.ts        # DB reset/cleanup helper script
+│   └── proto/            # gRPC protocol definition & modules
+│       ├── job.proto     # Protobuf service definitions
+│       ├── server.ts     # gRPC server implementation
+│       └── client.ts     # gRPC client entry point to submit jobs
 ├── prisma/
-│   └── schema.prisma     # PostgreSQL schema (job persistence)
-├── docker-compose.yml    # Redis service
-├── package.json
-└── tsconfig.json
+│   └── schema.prisma     # Prisma database schemas
+├── docker-compose.yml    # Redis & PostgreSQL Docker services
+├── package.json          # Node script commands & dependencies
+└── tsconfig.json         # TypeScript configuration
 ```
 
 ## Scaling Workers
 
-Each worker process gets a unique consumer name based on its PID. Simply run more instances:
+Each worker process gets a unique consumer name based on its process ID (`worker-${process.pid}`). You can run multiple instances to scale processing capacity:
 
 ```bash
-# Scale to 5 workers
-for i in {1..5}; do npm run worker & done
+# Scale to 3 workers
+for i in {1..3}; do npm run worker & done
 ```
 
-Redis Streams automatically distributes unread messages across all active consumers in the group. No configuration changes needed.
+Redis Streams will automatically balance new jobs across all active competing worker processes.
 
 ## Key Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| Redis Streams over BullMQ/Celery | Built from primitives to understand distributed systems internals |
-| Consumer groups over manual partitioning | Redis handles fair distribution and tracks pending entries |
-| `BLOCK 0` over polling | Zero CPU waste — worker sleeps until a message arrives |
-| PID-based consumer names | Automatic uniqueness without coordination; easy to identify in logs |
-| Prisma + PostgreSQL for persistence | Stream is ephemeral broker; DB provides durable audit trail |
-| gRPC over REST for inter-service | Binary protocol, schema-enforced contracts, bidirectional streaming ready |
+| **Redis Streams over Pub/Sub** | High durability, historical replays, at-least-once processing, and built-in consumer groups. |
+| **gRPC Server for Persistence** | Decentralizes database interaction so worker instances don't need direct PostgreSQL/Prisma connections, minimizing pool sizing limits and isolation risks. |
+| **Blocking Reads (`BLOCK 5000`)** | Eliminates polling overhead and keeps worker processes event-driven. |
+| **XAUTOCLAIM for Fault Tolerance** | Automatically detects and reclaims tasks from workers that crash mid-processing. |
+
+---
 
 ## License
 
