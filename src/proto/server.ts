@@ -35,18 +35,17 @@ const submitJob = async (call: any, callback: any) => {
             }
         });
         console.log(`Job ${job.id} saved to DB with status 'pending'`);
-    
+
         const entryId = await redis.xadd(
-            'video-queue',  // stream name
-            '*',            // auto-generate ID (timestamp-based)
+            'video-queue',
+            '*',
             'job', JSON.stringify(job)
         );
         console.log(`Job ${job.id} enqueued with stream entry ID: ${entryId}`);
-          callback(null, {
+        callback(null, {
             jobId: job.id,
             status: 'pending'
         })
-    
 }
 
 
@@ -57,18 +56,19 @@ const reportJobResult = async (call: any, callback: any) => {
 
     let resolvedStatus = status;
 
-    if (status === 'failed') {
-        const record = await prisma.job.findUnique({ where: { id: jobId }, select: { retryCount: true } });
-        const newCount = (record?.retryCount ?? 0) + 1;
+    if (status === 'failed'){
+        const [{ retryCount: newCount }] = await prisma.$queryRaw<{ retryCount: number }[]>`
+            UPDATE "Job"
+            SET "retryCount" = "retryCount" + 1,
+                "errorMessage" = ${errorMessage || null}
+            WHERE id = ${jobId}
+            RETURNING "retryCount"
+        `;
         resolvedStatus = newCount >= FAILED_COUNT ? 'dead' : 'failed';
 
         await prisma.job.update({
             where: { id: jobId },
-            data: {
-                status: resolvedStatus,
-                retryCount: newCount,
-                errorMessage: errorMessage || null,
-            }
+            data: { status: resolvedStatus }
         });
     } else {
         await prisma.job.update({
@@ -84,6 +84,7 @@ const reportJobResult = async (call: any, callback: any) => {
 
     callback(null, { jobId, status: resolvedStatus })
 }
+
 const server = new grpc.Server()
 server.addService(taskqueue.JobService.service, { submitJob, reportJobResult })
 server.bindAsync('0.0.0.0:50051', grpc.ServerCredentials.createInsecure(), () => {
