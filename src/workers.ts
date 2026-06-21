@@ -29,7 +29,7 @@ const createWorkerGroup = async () => {
         await redis.xgroup('CREATE', STREAM_NAME, GROUP_NAME, '0', 'MKSTREAM'); //MKSTREAM is used to create the stream if it doesn't exist
         console.log(`Worker group ${GROUP_NAME} created`);
     } catch (error) {
-        // Group already exists — that's fine
+        // Group already exists — that's fine   
     }
 }
 
@@ -67,14 +67,13 @@ const handleJob = async (messageId: string, job: VideoJob) => {
         })
     } catch (error) {
         console.error(`Job ${job.id} failed:`, error);
-     client.reportJobResult({
+        client.reportJobResult({
             jobId: job.id,
             status: 'failed',
             errorMessage: error instanceof Error ? error.message : 'Unknown error'
         }, (err: any, response: any) => {
             console.log('Failure reported:', response)
         })
-        await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
     }
 }
 
