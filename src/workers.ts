@@ -43,46 +43,46 @@ const processJob = async (job: VideoJob) => {
     }
 }
 
+const reportResult = (req: { jobId: string; status: string; errorMessage: string }): Promise<any> =>
+    new Promise((resolve, reject) => {
+        client.reportJobResult(req, (err: any, res: any) => {
+            if (err) reject(err);
+            else resolve(res);
+        });
+    });
+
 const handleJob = async (messageId: string, job: VideoJob) => {
     try {
-
-        client.reportJobResult({ 
-            jobId: job.id, 
-            status: 'processing',
-            errorMessage: ''
-        }, (err: any, response: any) => {
-            if (err) console.error('Error reporting processing status:', err);
-            else console.log('Job status updated to processing');
-        });
+        await reportResult({ jobId: job.id, status: 'processing', errorMessage: '' });
+        console.log(`Job ${job.id} status updated to processing`);
 
         await processJob(job);
+
         await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
-        client.reportJobResult({ 
-            jobId: job.id, 
-            status: 'completed',
-            errorMessage: ''
-        }, (err: any, response: any) => {
-            console.log('Result reported:', response)
-        })
+
+        // Best-effort after ack — don't let a report failure cascade into the failure path
+        reportResult({ jobId: job.id, status: 'completed', errorMessage: '' })
+            .then(() => console.log(`Job ${job.id} completed`))
+            .catch((err) => console.error(`Job ${job.id}: failed to report completed`, err));
+
     } catch (error) {
         console.error(`Job ${job.id} failed:`, error);
 
-        const response = await new Promise<any>((resolve, reject) => {
-            client.reportJobResult({
+        try {
+            const response = await reportResult({
                 jobId: job.id,
                 status: 'failed',
                 errorMessage: error instanceof Error ? error.message : 'Unknown error'
-            }, (err: any, res: any) => {
-                if (err) reject(err);
-                else resolve(res);
             });
-        });
 
-        if (response.status === 'dead') {
-            await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
-            console.log(`Job ${job.id} dead — removed from PEL`);
-        } else {
-            console.log(`Job ${job.id} failed, leaving in PEL for reclaim`);
+            if (response.status === 'dead') {
+                await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+                console.log(`Job ${job.id} dead — removed from PEL`);
+            } else {
+                console.log(`Job ${job.id} failed, leaving in PEL for reclaim`);
+            }
+        } catch (reportError) {
+            console.error(`Job ${job.id}: could not report failure, leaving in PEL`, reportError);
         }
     }
 }
