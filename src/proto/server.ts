@@ -50,19 +50,39 @@ const submitJob = async (call: any, callback: any) => {
 }
 
 
+const FAILED_COUNT = 5;
+
 const reportJobResult = async (call: any, callback: any) => {
     const { jobId, status, errorMessage } = call.request
-    
-    await prisma.job.update({
-        where: { id: jobId },
-        data: {
-            status: status,  // whatever worker reported
-            startedAt: status === 'processing' ? new Date() : undefined,
-            completedAt: status === 'completed' ? new Date() : undefined,
-            errorMessage: errorMessage || null,
-        }
-    })
-    callback(null, { jobId, status })
+
+    let resolvedStatus = status;
+
+    if (status === 'failed') {
+        const record = await prisma.job.findUnique({ where: { id: jobId }, select: { retryCount: true } });
+        const newCount = (record?.retryCount ?? 0) + 1;
+        resolvedStatus = newCount >= FAILED_COUNT ? 'dead' : 'failed';
+
+        await prisma.job.update({
+            where: { id: jobId },
+            data: {
+                status: resolvedStatus,
+                retryCount: newCount,
+                errorMessage: errorMessage || null,
+            }
+        });
+    } else {
+        await prisma.job.update({
+            where: { id: jobId },
+            data: {
+                status,
+                startedAt: status === 'processing' ? new Date() : undefined,
+                completedAt: status === 'completed' ? new Date() : undefined,
+                errorMessage: errorMessage || null,
+            }
+        });
+    }
+
+    callback(null, { jobId, status: resolvedStatus })
 }
 const server = new grpc.Server()
 server.addService(taskqueue.JobService.service, { submitJob, reportJobResult })

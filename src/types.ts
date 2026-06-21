@@ -13,7 +13,7 @@ export type VideoJob = {
         outputFormat: 'mp4' | 'webm'
     }
     createdAt: string
-    status: 'pending' | 'processing' | 'completed' | 'failed'
+    status: 'pending' | 'processing' | 'completed' | 'failed' | 'dead'
     workerId?: string
     retryCount: number
     errorMessage?: string

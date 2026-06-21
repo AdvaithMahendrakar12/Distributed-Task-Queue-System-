@@ -23,7 +23,6 @@ const STREAM_NAME = 'video-queue';
 const GROUP_NAME = 'video-workers';
 const CONSUMER_NAME = `worker-${process.pid}`
 const CLAIM_IDLE_TIME = 30000; // reclaim jobs idle for 30 seconds
-
 const createWorkerGroup = async () => {
     try {
         await redis.xgroup('CREATE', STREAM_NAME, GROUP_NAME, '0', 'MKSTREAM'); //MKSTREAM is used to create the stream if it doesn't exist
@@ -67,13 +66,24 @@ const handleJob = async (messageId: string, job: VideoJob) => {
         })
     } catch (error) {
         console.error(`Job ${job.id} failed:`, error);
-        client.reportJobResult({
-            jobId: job.id,
-            status: 'failed',
-            errorMessage: error instanceof Error ? error.message : 'Unknown error'
-        }, (err: any, response: any) => {
-            console.log('Failure reported:', response)
-        })
+
+        const response = await new Promise<any>((resolve, reject) => {
+            client.reportJobResult({
+                jobId: job.id,
+                status: 'failed',
+                errorMessage: error instanceof Error ? error.message : 'Unknown error'
+            }, (err: any, res: any) => {
+                if (err) reject(err);
+                else resolve(res);
+            });
+        });
+
+        if (response.status === 'dead') {
+            await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+            console.log(`Job ${job.id} dead — removed from PEL`);
+        } else {
+            console.log(`Job ${job.id} failed, leaving in PEL for reclaim`);
+        }
     }
 }
 
