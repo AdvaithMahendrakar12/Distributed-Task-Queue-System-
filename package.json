@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "grpc:server": "tsx src/proto/server.ts",
-    "grpc:submit": "tsx src/proto/client.ts"
+    "grpc:submit": "tsx src/proto/client.ts",
+    "admin": "tsx src/admin.ts"
   },
   "keywords": [],
   "type": "module",

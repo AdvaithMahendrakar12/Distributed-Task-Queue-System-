@@ -21,6 +21,7 @@ const client = new taskqueue.JobService(
 
 const STREAM_NAME = 'video-queue';
 const GROUP_NAME = 'video-workers';
+const DLQ_NAME = 'video-dlq'; // Redis list holding dead jobs for human triage
 const CONSUMER_NAME = `worker-${process.pid}`
 const CLAIM_IDLE_TIME = 30000; // reclaim jobs idle for 30 seconds
 const createWorkerGroup = async () => {
@@ -76,8 +77,18 @@ const handleJob = async (messageId: string, job: VideoJob) => {
             });
 
             if (response.status === 'dead') {
+                // Add to DLQ *before* removing from the main queue — if we crash
+                // between the two, the job lingers in the main queue and gets
+                // reclaimed, rather than vanishing.
+                const deadEntry = {
+                    ...job,
+                    status: 'dead',
+                    errorMessage: error instanceof Error ? error.message : 'Unknown error',
+                    deadAt: new Date().toISOString(),
+                };
+                await redis.lpush(DLQ_NAME, JSON.stringify(deadEntry));
                 await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
-                console.log(`Job ${job.id} dead — removed from PEL`);
+                console.log(`Job ${job.id} dead — moved to DLQ`);
             } else {
                 console.log(`Job ${job.id} failed, leaving in PEL for reclaim`);
             }
