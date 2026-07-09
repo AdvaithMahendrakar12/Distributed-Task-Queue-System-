@@ -27,4 +27,5 @@ message ReportJobResultRequest {
 message ReportJobResultResponse {
   string job_id = 1;
   string status = 2;
+  int32 retry_count = 3;
 }

@@ -55,6 +55,7 @@ const reportJobResult = async (call: any, callback: any) => {
     const { jobId, status, errorMessage } = call.request
 
     let resolvedStatus = status;
+    let retryCount = 0;
 
     if (status === 'failed'){
         const [{ retryCount: newCount }] = await prisma.$queryRaw<{ retryCount: number }[]>`
@@ -64,6 +65,7 @@ const reportJobResult = async (call: any, callback: any) => {
             WHERE id = ${jobId}
             RETURNING "retryCount"
         `;
+        retryCount = newCount;
         resolvedStatus = newCount >= FAILED_COUNT ? 'dead' : 'failed';
 
         await prisma.job.update({
@@ -82,7 +84,7 @@ const reportJobResult = async (call: any, callback: any) => {
         });
     }
 
-    callback(null, { jobId, status: resolvedStatus })
+    callback(null, { jobId, status: resolvedStatus, retryCount })
 }
 
 const server = new grpc.Server()
