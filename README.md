@@ -1,6 +1,6 @@
 # ⚡ Distributed Task Queue System
 
-A reliable, distributed task queue built with Redis Streams, consumer groups, and gRPC for at-least-once job delivery and status monitoring across multiple worker instances.
+A reliable, distributed task queue built with Redis Streams, consumer groups, and gRPC for at-least-once job delivery and status monitoring across multiple worker instances. Includes production-style failure handling: exponential backoff with jitter for retries, a dead-letter queue, and an operator control plane for redriving failed jobs.
 
 ## Architecture
 
@@ -18,21 +18,36 @@ A reliable, distributed task queue built with Redis Streams, consumer groups, an
                   └──────┬────┬──────┘                       │
                          │    │                              │
           Prisma (Save)  │    │ Redis (XADD)                 │ gRPC (ReportJobResult)
-                         ▼    ▼                              │
-                  ┌──────────┐ ┌─────────────────────┐       │
+                         ▼    ▼                              │  atomic retryCount++
+                  ┌──────────┐ ┌─────────────────────┐       │  dead vs failed decision
                   │PostgreSQL│ │    Redis Streams    │       │
-                  │ Database │ │    (video-queue)    │       │
-                  └──────────┘ └──────────┬──────────┘       │
-                                          │                  │
-                              XREADGROUP  │                  │
-                                          ▼                  │
-                              ┌───────────────────────┐      │
-                              │     Worker Group      │      │
-                              │ (video-workers group) │      │
-                              │ ┌─────────┐ ┌─────────┐│      │
+                  │ Database │ │    (video-queue)    │◀──┐   │
+                  └──────────┘ └──────────┬──────────┘   │   │
+                                          │              │   │
+                              XREADGROUP  │      XADD when due
+                                          ▼              │   │
+                              ┌───────────────────────┐  │   │
+                              │     Worker Group      │  │   │
+                              │ (video-workers group) │  │   │
+                              │ ┌─────────┐ ┌─────────┐│  │   │
                               │ │ Worker1 │ │ Worker2 │├──────┘
-                              │ └─────────┘ └─────────┘│
-                              └───────────────────────┘
+                              │ └─────────┘ └─────────┘│  │
+                              └───────┬───────┬───────┘  │
+                        failed (retry)│       │dead      │
+                         ZADD due-time│       │LPUSH     │
+                                      ▼       ▼          │
+                        ┌──────────────────┐ ┌──────────────────┐
+                        │  Retry ZSET      │ │  DLQ (video-dlq) │
+                        │ (video-retry)    │ │   Redis list     │
+                        │ score = dueAt    │ └────────┬─────────┘
+                        └────────┬─────────┘          │
+                     ZRANGEBYSCORE│                    │ LRANGE / LREM
+                                  ▼                    ▼
+                        ┌──────────────────┐ ┌──────────────────┐
+                        │    Scheduler     │ │   Admin API      │
+                        │ (steady 1s poll) │ │ list/redrive/    │
+                        │  re-enqueues ────┘ │ discard (:4000)  │
+                        └──────────────────┘ └──────────────────┘
 ```
 
 ## Features
@@ -43,6 +58,11 @@ A reliable, distributed task queue built with Redis Streams, consumer groups, an
 - **Blocking Reads** — Workers use `BLOCK 5000` for efficient, event-driven processing (zero polling waste).
 - **gRPC API Service** — Schema-enforced RPC boundaries with protocol buffers for submitting jobs (`SubmitJob`) and reporting worker statuses (`ReportJobResult`).
 - **Centralized Persistence** — Prisma ORM + PostgreSQL for durable job metadata and audit trails, decoupled from worker database dependencies.
+- **Atomic Retry Counting** — The server increments `retryCount` with a single `UPDATE ... RETURNING`, so concurrent reclaimers can never lose an update.
+- **Exponential Backoff + Jitter** — Failed jobs are parked in a Redis sorted set (`video-retry`) scored by a jittered due-time, then released by a steady-cadence scheduler. The jitter de-synchronizes herds of jobs that fail together, preventing a thundering-herd retry storm.
+- **Dead-Letter Queue (DLQ)** — After `FAILED_COUNT` (5) attempts a job is quarantined in a Redis list (`video-dlq`) instead of being lost or retried forever.
+- **Operator Control Plane** — A separate Express admin API to inspect the DLQ and human-trigger **redrive** (retry) or **discard** (drop) — deliberately decoupled from the automatic worker data plane.
+- **Two-Mode Fault Tolerance** — `XAUTOCLAIM` recovers jobs from *crashed* workers (PEL reclaim); the retry ZSET handles *failed-but-alive* jobs. Different failure modes, different mechanisms.
 - **Process-Level Isolation** — Each worker gets a unique consumer name (`worker-${PID}`) for independent scaling.
 - **Docker Compose** — Single-command local development with Redis and PostgreSQL.
 
@@ -88,11 +108,32 @@ npm run worker
 # Terminal 3 — Start worker 2 (to demonstrate parallel processing)
 npm run worker
 
-# Terminal 4 — Submit a job using the gRPC client
+# Terminal 4 — Start the retry scheduler (releases backed-off jobs when due)
+npm run scheduler
+
+# Terminal 5 — Start the admin control plane (DLQ inspect / redrive / discard)
+npm run admin
+
+# Terminal 6 — Submit a job using the gRPC client
 npm run grpc:submit
 ```
 
 *Note: You can still use the direct producer (`npm run producer`) to submit jobs directly to Redis and PostgreSQL, bypassing gRPC.*
+
+### Admin / DLQ Endpoints
+
+The admin control plane ([`src/admin.ts`](src/admin.ts)) runs on port `4000`:
+
+```bash
+# List all dead jobs waiting for triage
+curl http://localhost:4000/dlq
+
+# Redrive a dead job — reset its retry count and re-enqueue it
+curl -X POST http://localhost:4000/dlq/<job-id>/redrive
+
+# Discard a dead job permanently (the PostgreSQL row remains as history)
+curl -X POST http://localhost:4000/dlq/<job-id>/discard
+```
 
 ### Expected Output
 
@@ -111,9 +152,9 @@ Worker worker-23456 started
 Listening for jobs on 'video-queue'...
 
 [NEW] Picked up job a1b2c3d4-...
-Job status updated to processing
+Job a1b2c3d4-... status updated to processing
 Processing job a1b2c3d4-... (1080p - 10s)
-Result reported: { jobId: 'a1b2c3d4-...', status: 'completed' }
+Job a1b2c3d4-... completed
 ```
 
 ## gRPC API Design
@@ -148,7 +189,8 @@ message ReportJobResultRequest {
 
 message ReportJobResultResponse {
   string job_id = 1;
-  string status = 2;
+  string status = 2;      // resolved status: 'dead' once the retry limit is hit
+  int32 retry_count = 3;  // attempt number, used by the worker to compute backoff
 }
 ```
 
@@ -165,7 +207,7 @@ type VideoJob = {
     outputFormat: 'mp4' | 'webm';                 // Output format
   };
   createdAt: string;                              // ISO timestamp
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'dead';
   retryCount: number;
 };
 ```
@@ -179,17 +221,31 @@ type VideoJob = {
    - Saves the job to PostgreSQL via Prisma with a `pending` status.
    - Pushes the job onto the Redis Stream (`video-queue`) via `XADD`.
 3. Implements `ReportJobResult` which:
-   - Updates the job status (`processing`, `completed`, `failed`) and timestamps (`startedAt`, `completedAt`) in PostgreSQL.
+   - For `processing`/`completed`: updates status and timestamps (`startedAt`, `completedAt`) in PostgreSQL.
+   - For `failed`: **atomically** bumps `retryCount` with a single `UPDATE ... RETURNING`, then decides `dead` vs `failed` based on `FAILED_COUNT` (5). Returns the resolved status and the new `retryCount` to the worker.
 
 ### Worker (`src/workers.ts`)
 1. Joins the consumer group `video-workers` on startup.
-2. Periodically scans for stuck or stalled jobs using `XAUTOCLAIM`.
+2. Periodically scans for jobs abandoned by *crashed* workers using `XAUTOCLAIM` (PEL reclaim).
 3. Listens for new jobs using blocking read `XREADGROUP` (`BLOCK 5000`).
 4. When a job is picked up:
    - Calls `ReportJobResult` via the gRPC client to mark the job as `processing`.
    - Simulates video transcoding.
-   - On success: updates status to `completed` via gRPC and acknowledges with `XACK`.
-   - On failure: updates status to `failed` via gRPC with an error message and acknowledges with `XACK`.
+   - **On success:** acknowledges with `XACK` and reports `completed` (best-effort, after the ack).
+   - **On failure — not yet dead:** computes a jittered due-time via `backoff(retryCount)`, `ZADD`s the job into the retry ZSET (`video-retry`), then `XACK`s. (`ZADD` before `XACK` — a crash in between leaves the job reclaimable, not lost.)
+   - **On failure — dead:** `LPUSH`es the job into the DLQ (`video-dlq`), then `XACK`s.
+
+### Scheduler (`src/scheduler.ts`)
+1. Polls the retry ZSET on a steady 1-second heartbeat.
+2. `ZRANGEBYSCORE video-retry 0 <now>` fetches jobs whose due-time has passed.
+3. Re-enqueues each onto the main stream (`XADD`) then removes it from the ZSET (`ZREM`).
+4. The stagger that breaks a thundering herd lives in each job's **score**, not in this poll interval — the scheduler is deliberately metronomic.
+
+### Admin Control Plane (`src/admin.ts`)
+An Express server on port `4000` for human-triggered DLQ operations:
+- `GET /dlq` — list dead jobs (`LRANGE`).
+- `POST /dlq/:id/redrive` — reset the retry count and re-enqueue (`XADD` before `LREM`).
+- `POST /dlq/:id/discard` — permanently remove from the DLQ (`LREM`); the PostgreSQL row remains as history.
 
 ### Client/Producer (`src/proto/client.ts`)
 1. Connects to `localhost:50051` over insecure credentials.
@@ -204,7 +260,9 @@ distributed-task-queue-system/
 ├── src/
 │   ├── index.ts          # Redis & Prisma client initializations
 │   ├── producer.ts       # Direct producer script (DB + Redis stream writer)
-│   ├── workers.ts        # Worker pool consumer with gRPC result reporting
+│   ├── workers.ts        # Worker pool consumer: backoff scheduling + DLQ routing
+│   ├── scheduler.ts      # Retry scheduler: drains the video-retry ZSET when due
+│   ├── admin.ts          # Admin control plane: DLQ inspect / redrive / discard
 │   ├── types.ts          # Zod validation & TS type declarations
 │   ├── check-db.ts       # DB inspection utility script
 │   ├── cleanup.ts        # DB reset/cleanup helper script
@@ -238,6 +296,11 @@ Redis Streams will automatically balance new jobs across all active competing wo
 | **gRPC Server for Persistence** | Decentralizes database interaction so worker instances don't need direct PostgreSQL/Prisma connections, minimizing pool sizing limits and isolation risks. |
 | **Blocking Reads (`BLOCK 5000`)** | Eliminates polling overhead and keeps worker processes event-driven. |
 | **XAUTOCLAIM for Fault Tolerance** | Automatically detects and reclaims tasks from workers that crash mid-processing. |
+| **ZSET Scheduled Queue for Retries** | A single global `XAUTOCLAIM` idle-time can't express per-attempt backoff; a sorted set keyed by due-time can, and makes "what's due now?" a cheap range query. |
+| **Jitter in the Score, Not the Poll** | Randomizing each job's due-time (not the scheduler cadence) is what actually scatters a synchronized retry herd across time. |
+| **Add-to-Destination-Before-Remove** | Every cross-store move (stream→DLQ, stream→ZSET, ZSET→stream) adds to the target before removing from the source, so a mid-move crash yields a recoverable duplicate rather than data loss. |
+| **Control Plane vs Data Plane** | Redrive is an operator decision, never automatic — auto-reprocessing a DLQ just rebuilds the infinite retry loop the DLQ exists to stop. |
+| **Atomic `retryCount` Increment** | `UPDATE ... RETURNING` performs read-modify-write in one statement, so two concurrent reclaimers can't both read the same stale count. |
 
 ---
 
