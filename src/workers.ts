@@ -21,9 +21,21 @@ const client = new taskqueue.JobService(
 
 const STREAM_NAME = 'video-queue';
 const GROUP_NAME = 'video-workers';
-const DLQ_NAME = 'video-dlq'; // Redis list holding dead jobs for human triage
+const DLQ_NAME = 'video-dlq';       // Redis list holding dead jobs for human triage
+const RETRY_ZSET = 'video-retry';   // Redis sorted set: score = when the job is due to retry
 const CONSUMER_NAME = `worker-${process.pid}`
 const CLAIM_IDLE_TIME = 30000; // reclaim jobs idle for 30 seconds
+
+const BASE_DELAY = 1000;            // 1s
+const MAX_DELAY = 5 * 60 * 1000;   // cap backoff at 5 minutes
+
+// Exponential backoff with full jitter. Returns a wait time in ms.
+// attempt 1 -> ~1s window, 2 -> ~2s, 3 -> ~4s ... capped at MAX_DELAY.
+// The randomness (jitter) is what de-synchronizes a herd of jobs that failed together.
+const backoff = (attempt: number): number => {
+    const capped = Math.min(BASE_DELAY * 2 ** (attempt - 1), MAX_DELAY);
+    return Math.floor(Math.random() * capped); // full jitter: random point in [0, capped)
+}
 const createWorkerGroup = async () => {
     try {
         await redis.xgroup('CREATE', STREAM_NAME, GROUP_NAME, '0', 'MKSTREAM'); //MKSTREAM is used to create the stream if it doesn't exist
@@ -90,7 +102,17 @@ const handleJob = async (messageId: string, job: VideoJob) => {
                 await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
                 console.log(`Job ${job.id} dead — moved to DLQ`);
             } else {
-                console.log(`Job ${job.id} failed, leaving in PEL for reclaim`);
+
+                const attempt = response.retryCount;
+                const dueAt = Date.now() + backoff(attempt);
+
+                // Add to the retry set FIRST, then remove from the main queue (ack).
+                // Crash in between → job stays in the PEL and gets reclaimed, not lost.
+                await redis.zadd(RETRY_ZSET, dueAt, JSON.stringify(job));
+                await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+
+                const waitMs = dueAt - Date.now();
+                console.log(`Job ${job.id} failed (attempt ${attempt}) — retry scheduled in ~${waitMs}ms`);
             }
         } catch (reportError) {
             console.error(`Job ${job.id}: could not report failure, leaving in PEL`, reportError);
