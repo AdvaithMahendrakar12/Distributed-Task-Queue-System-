@@ -11,7 +11,8 @@
     "start": "node dist/index.js",
     "grpc:server": "tsx src/proto/server.ts",
     "grpc:submit": "tsx src/proto/client.ts",
-    "admin": "tsx src/admin.ts"
+    "admin": "tsx src/admin.ts",
+    "scheduler": "tsx src/scheduler.ts"
   },
   "keywords": [],
   "type": "module",
