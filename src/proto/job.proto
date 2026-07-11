@@ -11,6 +11,7 @@ service JobService{
 message SubmitJobRequest {
   string video_id  = 1;
   string video_url = 2;
+  string idempotency_key = 3; 
 }
 
 message SubmitJobResponse {

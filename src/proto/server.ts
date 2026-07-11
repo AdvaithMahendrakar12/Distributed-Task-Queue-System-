@@ -11,19 +11,32 @@ const taskqueue = (grpcObject as any).taskqueue
 
 const submitJob = async (call: any, callback: any) => {
     console.log('Received job:', call.request)
-        const job: VideoJob = {
-            id: crypto.randomUUID(),
-            type: 'process_video',
-            payload: {
-                videoId: call.request.videoId,
-                videoUrl: call.request.videoUrl,
-                resolution: '1080p',
-                outputFormat: 'mp4',
-            },
-            createdAt: new Date().toISOString(),
-            status: 'pending',
-            retryCount: 0,
-        };
+    const idempotencyKey: string = call.request.idempotencyKey || '';
+
+
+    if (idempotencyKey) {
+        const existing = await prisma.job.findUnique({ where: { idempotencyKey } });
+        if (existing) {
+            console.log(`Duplicate submit for key '${idempotencyKey}' — returning existing job ${existing.id}`);
+            return callback(null, { jobId: existing.id, status: existing.status });
+        }
+    }
+
+    const job: VideoJob = {
+        id: crypto.randomUUID(),
+        type: 'process_video',
+        payload: {
+            videoId: call.request.videoId,
+            videoUrl: call.request.videoUrl,
+            resolution: '1080p',
+            outputFormat: 'mp4',
+        },
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+        retryCount: 0,
+    };
+
+    try {
         // Transactional outbox: the Job row and the Outbox row commit together
         // in one DB transaction
         await prisma.$transaction([
@@ -34,6 +47,7 @@ const submitJob = async (call: any, callback: any) => {
                     payload: job.payload,
                     status: 'pending',
                     retryCount: 0,
+                    idempotencyKey: idempotencyKey || null,
                     createdAt: new Date(job.createdAt),
                 }
             }),
@@ -46,10 +60,18 @@ const submitJob = async (call: any, callback: any) => {
         ]);
         console.log(`Job ${job.id} saved to DB + outbox (pending)`);
 
-        callback(null, {
-            jobId: job.id,
-            status: 'pending'
-        })
+        callback(null, { jobId: job.id, status: 'pending' });
+    } catch (err: any) {
+        // A concurrent identical request won the race and inserted the key first.
+        // The unique constraint rejects ours (P2002); return the winner's job.
+        if (err?.code === 'P2002' && idempotencyKey) {
+            const existing = await prisma.job.findUnique({ where: { idempotencyKey } });
+            console.log(`Race on key '${idempotencyKey}' — returning existing job ${existing?.id}`);
+            return callback(null, { jobId: existing?.id, status: existing?.status });
+        }
+        console.error('submitJob failed:', err);
+        callback(err);
+    }
 }
 
 

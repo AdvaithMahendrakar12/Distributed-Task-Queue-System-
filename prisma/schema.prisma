@@ -7,16 +7,17 @@ datasource db {
 }
 
 model Job {
-  id            String    @id
-  type          String
-  payload       Json
-  status        String
-  workerId      String?
-  retryCount    Int
-  errorMessage  String?
-  createdAt     DateTime
-  startedAt     DateTime?
-  completedAt   DateTime?
+  id             String    @id
+  type           String
+  payload        Json
+  status         String
+  workerId       String?
+  retryCount     Int
+  errorMessage   String?
+  idempotencyKey String?   @unique  
+  createdAt      DateTime
+  startedAt      DateTime?
+  completedAt    DateTime?
 }
 
 
