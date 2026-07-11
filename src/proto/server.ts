@@ -1,7 +1,7 @@
 
 import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
-import { prisma, redis } from '..'
+import { prisma } from '..'
 import { VideoJob } from '../types'
 
 // 1. Load your proto file
@@ -24,24 +24,28 @@ const submitJob = async (call: any, callback: any) => {
             status: 'pending',
             retryCount: 0,
         };
-       await prisma.job.create({
-            data: {
-                id: job.id,
-                type: job.type,
-                payload: job.payload,
-                status: 'pending',
-                retryCount: 0,
-                createdAt: new Date(job.createdAt),
-            }
-        });
-        console.log(`Job ${job.id} saved to DB with status 'pending'`);
+        // Transactional outbox: the Job row and the Outbox row commit together
+        // in one DB transaction
+        await prisma.$transaction([
+            prisma.job.create({
+                data: {
+                    id: job.id,
+                    type: job.type,
+                    payload: job.payload,
+                    status: 'pending',
+                    retryCount: 0,
+                    createdAt: new Date(job.createdAt),
+                }
+            }),
+            prisma.outbox.create({
+                data: {
+                    jobId: job.id,
+                    payload: JSON.stringify(job),
+                }
+            }),
+        ]);
+        console.log(`Job ${job.id} saved to DB + outbox (pending)`);
 
-        const entryId = await redis.xadd(
-            'video-queue',
-            '*',
-            'job', JSON.stringify(job)
-        );
-        console.log(`Job ${job.id} enqueued with stream entry ID: ${entryId}`);
         callback(null, {
             jobId: job.id,
             status: 'pending'

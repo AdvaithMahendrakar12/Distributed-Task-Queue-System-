@@ -8,14 +8,26 @@ datasource db {
 
 model Job {
   id            String    @id
-  type          String    
-  payload       Json      
-  status        String    
-  workerId      String? 
-  retryCount    Int      
-  errorMessage  String?   
-  createdAt     DateTime  
-  startedAt     DateTime? 
-  completedAt   DateTime? 
+  type          String
+  payload       Json
+  status        String
+  workerId      String?
+  retryCount    Int
+  errorMessage  String?
+  createdAt     DateTime
+  startedAt     DateTime?
+  completedAt   DateTime?
+}
+
+
+model Outbox {
+  id           String    @id @default(uuid())
+  jobId        String
+  payload      String    // serialized VideoJob to XADD as the 'job' field
+  published    Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  publishedAt  DateTime?
+
+  @@index([published, createdAt])
 }
 
