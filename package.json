@@ -12,7 +12,8 @@
     "grpc:server": "tsx src/proto/server.ts",
     "grpc:submit": "tsx src/proto/client.ts",
     "admin": "tsx src/admin.ts",
-    "scheduler": "tsx src/scheduler.ts"
+    "scheduler": "tsx src/scheduler.ts",
+    "relay": "tsx src/relay.ts"
   },
   "keywords": [],
   "type": "module",
