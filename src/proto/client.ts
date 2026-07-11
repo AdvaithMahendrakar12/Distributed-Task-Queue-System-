@@ -11,8 +11,11 @@ const client = new taskqueue.JobService(
     grpc.credentials.createInsecure()
 )
 
+const idempotencyKey = process.env.IDEMPOTENCY_KEY || crypto.randomUUID()
+console.log('Submitting with idempotency key:', idempotencyKey)
+
 // Call SubmitJob
-client.submitJob({ videoId: 'vid_001', videoUrl: 'https://example.com/video.mp4' }, (err: any, response: any) => {
+client.submitJob({ videoId: 'vid_001', videoUrl: 'https://example.com/video.mp4', idempotencyKey }, (err: any, response: any) => {
     console.log('Response:', response)
 })
 
