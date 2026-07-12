@@ -1,53 +1,63 @@
 # ⚡ Distributed Task Queue System
 
-A reliable, distributed task queue built with Redis Streams, consumer groups, and gRPC for at-least-once job delivery and status monitoring across multiple worker instances. Includes production-style failure handling: exponential backoff with jitter for retries, a dead-letter queue, and an operator control plane for redriving failed jobs.
+A reliable, distributed task queue built with Redis Streams, consumer groups, and gRPC for at-least-once job delivery and status monitoring across multiple worker instances. Includes production-style reliability: a transactional outbox for lossless enqueue, client-supplied idempotency keys for dedupe, exponential backoff with jitter for retries, a dead-letter queue, and an operator control plane for redriving failed jobs.
 
 ## Architecture
 
 ```
                   ┌──────────────────┐
-                  │   gRPC Client    │
+                  │   gRPC Client    │  idempotency_key (dedupe)
                   │ (SubmitJob RPC)  │
                   └────────┬─────────┘
-                           │
                            │ gRPC (Port 50051)
                            ▼
                   ┌──────────────────┐
                   │   gRPC Server    │◀──────────────────────┐
                   │(src/proto/server)│                       │
-                  └──────┬────┬──────┘                       │
-                         │    │                              │
-          Prisma (Save)  │    │ Redis (XADD)                 │ gRPC (ReportJobResult)
-                         ▼    ▼                              │  atomic retryCount++
-                  ┌──────────┐ ┌─────────────────────┐       │  dead vs failed decision
-                  │PostgreSQL│ │    Redis Streams    │       │
-                  │ Database │ │    (video-queue)    │◀──┐   │
-                  └──────────┘ └──────────┬──────────┘   │   │
-                                          │              │   │
-                              XREADGROUP  │      XADD when due
-                                          ▼              │   │
-                              ┌───────────────────────┐  │   │
-                              │     Worker Group      │  │   │
-                              │ (video-workers group) │  │   │
-                              │ ┌─────────┐ ┌─────────┐│  │   │
-                              │ │ Worker1 │ │ Worker2 │├──────┘
-                              │ └─────────┘ └─────────┘│  │
-                              └───────┬───────┬───────┘  │
-                        failed (retry)│       │dead      │
-                         ZADD due-time│       │LPUSH     │
-                                      ▼       ▼          │
-                        ┌──────────────────┐ ┌──────────────────┐
-                        │  Retry ZSET      │ │  DLQ (video-dlq) │
-                        │ (video-retry)    │ │   Redis list     │
-                        │ score = dueAt    │ └────────┬─────────┘
-                        └────────┬─────────┘          │
-                     ZRANGEBYSCORE│                    │ LRANGE / LREM
-                                  ▼                    ▼
-                        ┌──────────────────┐ ┌──────────────────┐
-                        │    Scheduler     │ │   Admin API      │
-                        │ (steady 1s poll) │ │ list/redrive/    │
-                        │  re-enqueues ────┘ │ discard (:4000)  │
-                        └──────────────────┘ └──────────────────┘
+                  └────────┬─────────┘                       │
+                           │ ONE transaction                 │ gRPC (ReportJobResult)
+                           │ (Job + Outbox rows)             │  atomic retryCount++
+                           ▼                                 │  dead vs failed decision
+                  ┌──────────────────┐                       │
+                  │   PostgreSQL     │                       │
+                  │  Job + Outbox    │                       │
+                  └────────┬─────────┘                       │
+                  poll unpublished │  ▲ mark published        │
+                                   ▼  │                       │
+                          ┌──────────────────┐               │
+                          │      Relay       │ (sole stream publisher)
+                          │ (steady 1s poll) │               │
+                          └────────┬─────────┘               │
+                                   │ XADD                    │
+                                   ▼                         │
+                          ┌─────────────────────┐            │
+                          │    Redis Streams    │◀──┐        │
+                          │    (video-queue)    │   │        │
+                          └──────────┬──────────┘   │        │
+                              XREADGROUP │      XADD when due │
+                                        ▼            │       │
+                            ┌───────────────────────┐│       │
+                            │     Worker Group      ││       │
+                            │ (video-workers group) ││       │
+                            │ ┌─────────┐ ┌─────────┐│       │
+                            │ │ Worker1 │ │ Worker2 │├───────┘
+                            │ └─────────┘ └─────────┘│
+                            └───────┬───────┬───────┘│
+                      failed (retry)│       │dead    │
+                       ZADD due-time│       │LPUSH   │
+                                    ▼       ▼        │
+                      ┌──────────────────┐ ┌──────────────────┐
+                      │  Retry ZSET      │ │  DLQ (video-dlq) │
+                      │ (video-retry)    │ │   Redis list     │
+                      │ score = dueAt    │ └────────┬─────────┘
+                      └────────┬─────────┘          │
+                   ZRANGEBYSCORE│                    │ LRANGE / LREM
+                                ▼                    ▼
+                      ┌──────────────────┐ ┌──────────────────┐
+                      │    Scheduler     │ │   Admin API      │
+                      │ (steady 1s poll) │ │ list/redrive/    │
+                      │ re-enqueue ──────┘ │ discard (:4000)  │
+                      └──────────────────┘ └──────────────────┘
 ```
 
 ## Features
@@ -58,6 +68,8 @@ A reliable, distributed task queue built with Redis Streams, consumer groups, an
 - **Blocking Reads** — Workers use `BLOCK 5000` for efficient, event-driven processing (zero polling waste).
 - **gRPC API Service** — Schema-enforced RPC boundaries with protocol buffers for submitting jobs (`SubmitJob`) and reporting worker statuses (`ReportJobResult`).
 - **Centralized Persistence** — Prisma ORM + PostgreSQL for durable job metadata and audit trails, decoupled from worker database dependencies.
+- **Transactional Outbox** — `SubmitJob` writes the Job row and an Outbox row in a single DB transaction and never touches Redis; a relay is the sole publisher to the stream. This removes the dual-write, so a crash can never leave a job persisted-but-never-enqueued.
+- **Idempotent Submission** — A client-supplied `idempotencyKey` (unique-constrained) dedupes retried submits: the server returns the existing job instead of creating a duplicate, and a `P2002` catch closes the concurrent-request race.
 - **Atomic Retry Counting** — The server increments `retryCount` with a single `UPDATE ... RETURNING`, so concurrent reclaimers can never lose an update.
 - **Exponential Backoff + Jitter** — Failed jobs are parked in a Redis sorted set (`video-retry`) scored by a jittered due-time, then released by a steady-cadence scheduler. The jitter de-synchronizes herds of jobs that fail together, preventing a thundering-herd retry storm.
 - **Dead-Letter Queue (DLQ)** — After `FAILED_COUNT` (5) attempts a job is quarantined in a Redis list (`video-dlq`) instead of being lost or retried forever.
@@ -96,7 +108,7 @@ docker-compose up -d
 
 ### 2. Start Services
 
-To run the full gRPC-enabled system, you need to spin up the gRPC Server, the Worker processes, and a client/producer to submit jobs.
+The full system is a set of cooperating processes: the gRPC server, one or more workers, the outbox relay, the retry scheduler, the admin control plane, and a client to submit jobs.
 
 ```bash
 # Terminal 1 — Start the gRPC Server
@@ -108,17 +120,31 @@ npm run worker
 # Terminal 3 — Start worker 2 (to demonstrate parallel processing)
 npm run worker
 
-# Terminal 4 — Start the retry scheduler (releases backed-off jobs when due)
+# Terminal 4 — Start the outbox relay (publishes committed jobs to the stream)
+npm run relay
+
+# Terminal 5 — Start the retry scheduler (releases backed-off jobs when due)
 npm run scheduler
 
-# Terminal 5 — Start the admin control plane (DLQ inspect / redrive / discard)
+# Terminal 6 — Start the admin control plane (DLQ inspect / redrive / discard)
 npm run admin
 
-# Terminal 6 — Submit a job using the gRPC client
+# Terminal 7 — Submit a job using the gRPC client
 npm run grpc:submit
 ```
 
-*Note: You can still use the direct producer (`npm run producer`) to submit jobs directly to Redis and PostgreSQL, bypassing gRPC.*
+*Note: the relay is what moves a submitted job from the outbox to the stream. Without it running, jobs stay in the outbox (`published=false`) and never reach a worker.*
+
+### Idempotent Submits
+
+The client sends an `idempotencyKey` (random per run, or set `IDEMPOTENCY_KEY` to reuse). Resubmitting with the same key returns the existing job instead of creating a duplicate:
+
+```bash
+IDEMPOTENCY_KEY=demo-123 npm run grpc:submit   # creates the job
+IDEMPOTENCY_KEY=demo-123 npm run grpc:submit   # returns the same jobId, no duplicate
+```
+
+*Note: You can still use the direct producer (`npm run producer`) to submit jobs directly to Redis and PostgreSQL, bypassing gRPC and the outbox.*
 
 ### Admin / DLQ Endpoints
 
@@ -140,9 +166,14 @@ curl -X POST http://localhost:4000/dlq/<job-id>/discard
 **gRPC Server:**
 ```
 gRPC server running on port 50051
-Received job: { videoId: 'vid_001', videoUrl: 'https://example.com/video.mp4' }
-Job a1b2c3d4-... saved to DB with status 'pending'
-Job a1b2c3d4-... enqueued with stream entry ID: 1711900000000-0
+Received job: { videoId: 'vid_001', videoUrl: 'https://example.com/video.mp4', idempotencyKey: '...' }
+Job a1b2c3d4-... saved to DB + outbox (pending)
+```
+
+**Relay:**
+```
+Outbox relay started — polling for unpublished jobs every 1000ms
+[RELAY] Published job a1b2c3d4-...
 ```
 
 **Worker:**
@@ -174,6 +205,7 @@ service JobService {
 message SubmitJobRequest {
   string video_id  = 1;
   string video_url = 2;
+  string idempotency_key = 3;  // client-supplied, stable across retries; server dedupes on it
 }
 
 message SubmitJobResponse {
@@ -210,6 +242,10 @@ type VideoJob = {
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'dead';
   retryCount: number;
 };
+
+// The Job row also carries a unique, nullable `idempotencyKey` (client-supplied,
+// for dedupe). Enqueue intent is recorded in a companion `Outbox` row written in
+// the same transaction; the relay publishes it and flips `published`.
 ```
 
 ## How It Works
@@ -217,9 +253,9 @@ type VideoJob = {
 ### gRPC Server (`src/proto/server.ts`)
 1. Exposes a gRPC service listening on port `50051`.
 2. Implements `SubmitJob` which:
-   - Formulates a complete `VideoJob` payload.
-   - Saves the job to PostgreSQL via Prisma with a `pending` status.
-   - Pushes the job onto the Redis Stream (`video-queue`) via `XADD`.
+   - Checks the client-supplied `idempotencyKey`; if a job already exists for it, returns that job (no duplicate).
+   - Otherwise writes the `Job` row (`pending`) **and** an `Outbox` row in a **single `prisma.$transaction`** — and never touches Redis. This is the transactional outbox: no dual-write in the request path.
+   - Catches a `P2002` unique violation (two identical requests racing) and returns the winner's job.
 3. Implements `ReportJobResult` which:
    - For `processing`/`completed`: updates status and timestamps (`startedAt`, `completedAt`) in PostgreSQL.
    - For `failed`: **atomically** bumps `retryCount` with a single `UPDATE ... RETURNING`, then decides `dead` vs `failed` based on `FAILED_COUNT` (5). Returns the resolved status and the new `retryCount` to the worker.
@@ -234,6 +270,12 @@ type VideoJob = {
    - **On success:** acknowledges with `XACK` and reports `completed` (best-effort, after the ack).
    - **On failure — not yet dead:** computes a jittered due-time via `backoff(retryCount)`, `ZADD`s the job into the retry ZSET (`video-retry`), then `XACK`s. (`ZADD` before `XACK` — a crash in between leaves the job reclaimable, not lost.)
    - **On failure — dead:** `LPUSH`es the job into the DLQ (`video-dlq`), then `XACK`s.
+
+### Relay (`src/relay.ts`)
+The **only** publisher to the stream. It closes the dual-write gap that `SubmitJob` deliberately left open:
+1. Polls PostgreSQL for `Outbox` rows where `published = false` on a steady 1-second heartbeat.
+2. `XADD`s each to the main stream, then flips `published = true` (publish *before* mark — a crash yields a re-published duplicate, absorbed by idempotency, never a lost job).
+3. Because enqueue intent is a durable row written atomically with the job, a crashed `SubmitJob` can't lose work — the relay picks it up on the next tick. The happy path and the crash-recovery path are the same path.
 
 ### Scheduler (`src/scheduler.ts`)
 1. Polls the retry ZSET on a steady 1-second heartbeat.
@@ -261,6 +303,7 @@ distributed-task-queue-system/
 │   ├── index.ts          # Redis & Prisma client initializations
 │   ├── producer.ts       # Direct producer script (DB + Redis stream writer)
 │   ├── workers.ts        # Worker pool consumer: backoff scheduling + DLQ routing
+│   ├── relay.ts          # Outbox relay: sole publisher of committed jobs to the stream
 │   ├── scheduler.ts      # Retry scheduler: drains the video-retry ZSET when due
 │   ├── admin.ts          # Admin control plane: DLQ inspect / redrive / discard
 │   ├── types.ts          # Zod validation & TS type declarations
@@ -271,7 +314,8 @@ distributed-task-queue-system/
 │       ├── server.ts     # gRPC server implementation
 │       └── client.ts     # gRPC client entry point to submit jobs
 ├── prisma/
-│   └── schema.prisma     # Prisma database schemas
+│   ├── schema.prisma     # Prisma schemas (Job + Outbox)
+│   └── migrations/       # SQL migration history
 ├── docker-compose.yml    # Redis & PostgreSQL Docker services
 ├── package.json          # Node script commands & dependencies
 └── tsconfig.json         # TypeScript configuration
@@ -294,6 +338,8 @@ Redis Streams will automatically balance new jobs across all active competing wo
 |----------|-----------|
 | **Redis Streams over Pub/Sub** | High durability, historical replays, at-least-once processing, and built-in consumer groups. |
 | **gRPC Server for Persistence** | Decentralizes database interaction so worker instances don't need direct PostgreSQL/Prisma connections, minimizing pool sizing limits and isolation risks. |
+| **Transactional Outbox** | Writing the job and its enqueue-intent in one DB transaction (and letting a relay publish) removes the persist-then-enqueue dual-write, so a crash can't strand a job that's saved but never queued. |
+| **Client-Supplied Idempotency Key** | A stable, client-generated key (not a per-request server UUID) is the only way to recognize a retried submit as the same logical request; a unique constraint makes the dedupe race-safe. |
 | **Blocking Reads (`BLOCK 5000`)** | Eliminates polling overhead and keeps worker processes event-driven. |
 | **XAUTOCLAIM for Fault Tolerance** | Automatically detects and reclaims tasks from workers that crash mid-processing. |
 | **ZSET Scheduled Queue for Retries** | A single global `XAUTOCLAIM` idle-time can't express per-attempt backoff; a sorted set keyed by due-time can, and makes "what's due now?" a cheap range query. |
