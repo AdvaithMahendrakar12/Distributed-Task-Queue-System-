@@ -76,7 +76,7 @@ A reliable, distributed task queue built with Redis Streams, consumer groups, an
 - **Operator Control Plane** — A separate Express admin API to inspect the DLQ and human-trigger **redrive** (retry) or **discard** (drop) — deliberately decoupled from the automatic worker data plane.
 - **Two-Mode Fault Tolerance** — `XAUTOCLAIM` recovers jobs from *crashed* workers (PEL reclaim); the retry ZSET handles *failed-but-alive* jobs. Different failure modes, different mechanisms.
 - **Process-Level Isolation** — Each worker gets a unique consumer name (`worker-${PID}`) for independent scaling.
-- **Docker Compose** — Single-command local development with Redis and PostgreSQL.
+- **Docker Compose** — Local Redis via a single `docker-compose up -d`.
 
 ## Tech Stack
 
@@ -84,7 +84,7 @@ A reliable, distributed task queue built with Redis Streams, consumer groups, an
 |-----------|-----------|
 | Runtime | Node.js + TypeScript |
 | Message Broker | Redis Streams |
-| Database | PostgreSQL (via Prisma ORM) |
+| Database | PostgreSQL on [Neon](https://neon.tech) (via Prisma ORM) |
 | RPC Framework | gRPC (`@grpc/grpc-js` + `@grpc/proto-loader`) |
 | Validation | Zod |
 | Containerization | Docker + Docker Compose |
@@ -102,8 +102,17 @@ cd Distributed-Task-Queue-System-
 # Install dependencies
 npm install
 
-# Start Redis & PostgreSQL services
+# Start local Redis
 docker-compose up -d
+
+# Point Prisma at your Neon Postgres database
+# Create a free project at https://neon.tech, then put the connection
+# string in .env (already gitignored):
+#   DATABASE_URL="postgresql://user:pass@ep-xxxx.neon.tech/neondb?sslmode=require"
+#   REDIS_URL="redis://localhost:6379"
+
+# Apply migrations against Neon
+npx prisma migrate deploy
 ```
 
 ### 2. Start Services
@@ -316,7 +325,7 @@ distributed-task-queue-system/
 ├── prisma/
 │   ├── schema.prisma     # Prisma schemas (Job + Outbox)
 │   └── migrations/       # SQL migration history
-├── docker-compose.yml    # Redis & PostgreSQL Docker services
+├── docker-compose.yml    # Local Redis (Postgres is hosted on Neon)
 ├── package.json          # Node script commands & dependencies
 └── tsconfig.json         # TypeScript configuration
 ```
