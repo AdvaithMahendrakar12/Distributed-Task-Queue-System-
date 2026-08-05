@@ -11,6 +11,22 @@ const app = express();
 app.use(express.json());
 
 
+// Prometheus scrapes this. The exposition format is just plain text:
+//   # HELP <name> <description>
+//   # TYPE <name> <counter|gauge|histogram>
+//   <name> <value>
+// No library needed to serve it — prom-client (added later) only formats this
+// for you. Hardcoded for now so the scrape pipeline can be verified on its own.
+app.get('/metrics', (_req, res) => {
+    res.set('Content-Type', 'text/plain');
+    res.send(
+        '# HELP dtqs_up 1 if the admin server is serving metrics\n' +
+        '# TYPE dtqs_up gauge\n' +
+        'dtqs_up 1\n'
+    );
+});
+
+
 app.get('/dlq', async (_req, res) => {
     const raw = await redis.lrange(DLQ_NAME, 0, -1);
     const jobs = raw.map((entry) => JSON.parse(entry));
