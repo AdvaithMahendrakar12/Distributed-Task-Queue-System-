@@ -3,6 +3,7 @@ import { VideoJob } from './types';
 import { redis } from '.';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
+import { incrCounter } from './metrics';
 
 // Initialize gRPC Client
 const packageDef = protoLoader.loadSync('./src/proto/job.proto');
@@ -72,6 +73,7 @@ const handleJob = async (messageId: string, job: VideoJob) => {
         await processJob(job);
 
         await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+        await incrCounter('jobs_completed_total');
 
         // Best-effort after ack — don't let a report failure cascade into the failure path
         reportResult({ jobId: job.id, status: 'completed', errorMessage: '' })
@@ -100,6 +102,7 @@ const handleJob = async (messageId: string, job: VideoJob) => {
                 };
                 await redis.lpush(DLQ_NAME, JSON.stringify(deadEntry));
                 await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+                await incrCounter('jobs_dead_total');
                 console.log(`Job ${job.id} dead — moved to DLQ`);
             } else {
 
@@ -110,6 +113,7 @@ const handleJob = async (messageId: string, job: VideoJob) => {
                 // Crash in between → job stays in the PEL and gets reclaimed, not lost.
                 await redis.zadd(RETRY_ZSET, dueAt, JSON.stringify(job));
                 await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+                await incrCounter('jobs_failed_total');
 
                 const waitMs = dueAt - Date.now();
                 console.log(`Job ${job.id} failed (attempt ${attempt}) — retry scheduled in ~${waitMs}ms`);

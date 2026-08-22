@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { redis, prisma } from '.';
 import { VideoJob } from './types';
+import { renderMetrics } from './metrics';
 
 
 const STREAM_NAME = 'video-queue';
@@ -17,13 +18,9 @@ app.use(express.json());
 //   <name> <value>
 // No library needed to serve it — prom-client (added later) only formats this
 // for you. Hardcoded for now so the scrape pipeline can be verified on its own.
-app.get('/metrics', (_req, res) => {
+app.get('/metrics', async (_req, res) => {
     res.set('Content-Type', 'text/plain');
-    res.send(
-        '# HELP dtqs_up 1 if the admin server is serving metrics\n' +
-        '# TYPE dtqs_up gauge\n' +
-        'dtqs_up 1\n'
-    );
+    res.send(await renderMetrics());
 });
 
 
@@ -83,5 +80,6 @@ app.listen(PORT, () => {
     console.log(`Admin control plane running on http://localhost:${PORT}`);
     console.log('  GET  /dlq              — list dead jobs');
     console.log('  POST /dlq/:id/redrive  — re-enqueue a dead job');
-    console.log('  POST /dlq/:id/discard  — permanently drop a dead job');
+  console.log('  POST /dlq/:id/discard  — permanently drop a dead job');
+  
 });
