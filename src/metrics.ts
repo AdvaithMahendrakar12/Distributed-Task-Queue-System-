@@ -4,9 +4,14 @@ export const incrCounter = (name: string) =>
     redis.incr(`metrics:${name}`);
 
 const COUNTERS: Record<string, string> = {
+    jobs_submitted_total: 'New jobs accepted by SubmitJob (excludes idempotent duplicates)',
+    jobs_duplicate_submit_total: 'Submits that matched an existing idempotency key',
+    outbox_published_total: 'Outbox rows published to the stream by the relay',
     jobs_completed_total: 'Jobs that finished successfully',
     jobs_failed_total: 'Failed processing attempts that were scheduled to retry',
     jobs_dead_total: 'Jobs that exhausted retries and moved to the DLQ',
+    jobs_redriven_total: 'Dead jobs redriven back to the queue by an operator',
+    jobs_discarded_total: 'Dead jobs discarded from the DLQ by an operator',
 };
 
 const STREAM_NAME = 'video-queue';

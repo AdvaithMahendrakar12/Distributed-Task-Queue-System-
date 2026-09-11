@@ -3,6 +3,7 @@ import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import { prisma } from '..'
 import { VideoJob } from '../types'
+import { incrCounter } from '../metrics'
 
 // 1. Load your proto file
 const packageDef = protoLoader.loadSync('./src/proto/job.proto')
@@ -18,6 +19,7 @@ const submitJob = async (call: any, callback: any) => {
         const existing = await prisma.job.findUnique({ where: { idempotencyKey } });
         if (existing) {
             console.log(`Duplicate submit for key '${idempotencyKey}' — returning existing job ${existing.id}`);
+            await incrCounter('jobs_duplicate_submit_total');
             return callback(null, { jobId: existing.id, status: existing.status });
         }
     }
@@ -59,6 +61,7 @@ const submitJob = async (call: any, callback: any) => {
             }),
         ]);
         console.log(`Job ${job.id} saved to DB + outbox (pending)`);
+        await incrCounter('jobs_submitted_total');
 
         callback(null, { jobId: job.id, status: 'pending' });
     } catch (err: any) {
@@ -67,6 +70,7 @@ const submitJob = async (call: any, callback: any) => {
         if (err?.code === 'P2002' && idempotencyKey) {
             const existing = await prisma.job.findUnique({ where: { idempotencyKey } });
             console.log(`Race on key '${idempotencyKey}' — returning existing job ${existing?.id}`);
+            await incrCounter('jobs_duplicate_submit_total');
             return callback(null, { jobId: existing?.id, status: existing?.status });
         }
         console.error('submitJob failed:', err);

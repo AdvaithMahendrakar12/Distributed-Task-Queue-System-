@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { redis, prisma } from '.';
+import { incrCounter } from './metrics';
 
 
 
@@ -21,6 +22,7 @@ const tick = async () => {
             where: { id: row.id },
             data: { published: true, publishedAt: new Date() },
         });
+        await incrCounter('outbox_published_total');
         console.log(`[RELAY] Published job ${row.jobId}`);
     }
 };

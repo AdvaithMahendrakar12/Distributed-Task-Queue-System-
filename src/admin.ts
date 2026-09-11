@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { redis, prisma } from '.';
 import { VideoJob } from './types';
-import { renderMetrics } from './metrics';
+import { incrCounter, renderMetrics } from './metrics';
 
 
 const STREAM_NAME = 'video-queue';
@@ -57,6 +57,7 @@ app.post('/dlq/:id/redrive', async (req, res) => {
     // a possible duplicate DLQ entry, which is the lesser evil.
     await redis.xadd(STREAM_NAME, '*', 'job', JSON.stringify(freshJob));
     await redis.lrem(DLQ_NAME, 1, entryStr);
+    await incrCounter('jobs_redriven_total');
 
     res.json({ redriven: id, status: 'pending' });
 });
@@ -72,6 +73,7 @@ app.post('/dlq/:id/discard', async (req, res) => {
     }
 
     await redis.lrem(DLQ_NAME, 1, entryStr);
+    await incrCounter('jobs_discarded_total');
     res.json({ discarded: id });
 });
 
