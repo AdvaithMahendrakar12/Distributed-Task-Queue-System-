@@ -7,6 +7,7 @@ const COUNTERS: Record<string, string> = {
     jobs_submitted_total: 'New jobs accepted by SubmitJob (excludes idempotent duplicates)',
     jobs_duplicate_submit_total: 'Submits that matched an existing idempotency key',
     outbox_published_total: 'Outbox rows published to the stream by the relay',
+    jobs_skipped_duplicate_total: 'Duplicate deliveries skipped because the job was already completed or dead',
     jobs_completed_total: 'Jobs that finished successfully',
     jobs_failed_total: 'Failed processing attempts that were scheduled to retry',
     jobs_dead_total: 'Jobs that exhausted retries and moved to the DLQ',

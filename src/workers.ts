@@ -67,7 +67,17 @@ const reportResult = (req: { jobId: string; status: string; errorMessage: string
 
 const handleJob = async (messageId: string, job: VideoJob) => {
     try {
-        await reportResult({ jobId: job.id, status: 'processing', errorMessage: '' });
+        // Claim the job before doing any work. Delivery is at-least-once (the
+        // relay, the scheduler and redrive can all re-deliver), so without this
+        // a duplicate would be processed twice. A refused claim means another
+        // delivery already finished it: ack and walk away.
+        const claim = await reportResult({ jobId: job.id, status: 'processing', errorMessage: '' });
+        if (!claim.claimed) {
+            await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
+            await incrCounter('jobs_skipped_duplicate_total');
+            console.log(`Job ${job.id} already completed/dead — skipping duplicate delivery`);
+            return;
+        }
         console.log(`Job ${job.id} status updated to processing`);
 
         await processJob(job);

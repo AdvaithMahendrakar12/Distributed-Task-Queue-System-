@@ -87,6 +87,32 @@ const reportJobResult = async (call: any, callback: any) => {
     let resolvedStatus = status;
     let retryCount = 0;
 
+    if (status === 'processing') {
+        // Atomic claim. The worker asks for the job in the same call that used
+        // to just mark it 'processing'. The WHERE clause refuses the claim if a
+        // previous delivery already drove the job to a terminal state, so a
+        // duplicate delivery becomes a no-op instead of duplicate work.
+        //
+        // 'processing' is deliberately still claimable: a worker can die
+        // mid-job leaving the row stuck there, and XAUTOCLAIM must be able to
+        // hand that job to a healthy worker.
+        const claimedRows = await prisma.$queryRaw<{ id: string }[]>`
+            UPDATE "Job"
+            SET status = 'processing',
+                "startedAt" = now()
+            WHERE id = ${jobId}
+              AND status NOT IN ('completed', 'dead')
+            RETURNING id
+        `;
+        const claimed = claimedRows.length > 0;
+        return callback(null, {
+            jobId,
+            status: claimed ? 'processing' : 'skip',
+            retryCount: 0,
+            claimed,
+        });
+    }
+
     if (status === 'failed'){
         const [{ retryCount: newCount }] = await prisma.$queryRaw<{ retryCount: number }[]>`
             UPDATE "Job"
@@ -114,7 +140,7 @@ const reportJobResult = async (call: any, callback: any) => {
         });
     }
 
-    callback(null, { jobId, status: resolvedStatus, retryCount })
+    callback(null, { jobId, status: resolvedStatus, retryCount, claimed: true })
 }
 
 const server = new grpc.Server()

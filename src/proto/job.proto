@@ -29,4 +29,5 @@ message ReportJobResultResponse {
   string job_id = 1;
   string status = 2;
   int32 retry_count = 3;
+  bool claimed = 4;  // false => another delivery already finished this job; skip it
 }
