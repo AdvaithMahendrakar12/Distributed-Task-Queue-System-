@@ -78,6 +78,84 @@ A reliable, distributed task queue built with Redis Streams, consumer groups, an
 - **Process-Level Isolation** — Each worker gets a unique consumer name (`worker-${PID}`) for independent scaling.
 - **Docker Compose** — Local Redis via a single `docker-compose up -d`.
 
+## Observability
+
+Prometheus scrapes the queue every 5s and Grafana renders it. The dashboard is
+provisioned from this repo, so it appears automatically — no clicking required.
+
+![Grafana dashboard](docs/dashboard.png)
+
+### Running it
+
+`docker compose up -d` already starts Prometheus and Grafana alongside Redis:
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| Metrics endpoint | http://localhost:4000/metrics | Served by the admin process |
+| Prometheus | http://localhost:9090 | `/targets` should show `task-queue` **UP** |
+| Grafana | http://localhost:3000/d/task-queue | Login `admin` / `admin` |
+
+The admin process must be running (`npm run admin`) for Prometheus to have
+anything to scrape.
+
+### What the panels mean
+
+**Top row — at a glance.** `Jobs completed` and `Failed attempts` are running
+totals. `DLQ depth` turns red above 0 — anything sitting there needs a human.
+`Outbox backlog` goes yellow at 1 and red at 10; sustained growth means the
+relay is down and jobs are committed but never reaching the stream.
+
+**Processing rate.** `completed/s`, `failed/s` and `dead/s`. Counters are always
+wrapped in `rate()` — the raw value only ever climbs, so the slope is the
+signal, not the number.
+
+**Intake & publish rate.** `submitted/s`, `duplicate/s` and `published/s`.
+Submitted and published should track each other; a persistent gap between them
+*is* the outbox-lag signal. `duplicate/s` shows idempotency keys doing their job.
+
+**Queue depths.** Stream length, retry ZSET and outbox backlog, graphed raw —
+for a gauge the current value is the answer. Note the stream length only grows:
+`XACK` removes a message from the consumer group's pending list but does **not**
+delete the entry, and every retry appends a fresh one.
+
+**DLQ & operator actions.** Dead-letter backlog next to the manual
+redrive/discard actions taken through the admin API.
+
+### The metric catalogue
+
+Counters (event happened — query with `rate()`):
+
+| Metric | Incremented when |
+|--------|------------------|
+| `jobs_submitted_total` | A new job is accepted by `SubmitJob` |
+| `jobs_duplicate_submit_total` | A submit matched an existing idempotency key |
+| `outbox_published_total` | The relay publishes an outbox row to the stream |
+| `jobs_completed_total` | A worker finishes a job successfully |
+| `jobs_failed_total` | Any failed attempt (not just the final one) |
+| `jobs_dead_total` | A job exhausts its retries and moves to the DLQ |
+| `jobs_redriven_total` | An operator redrives a dead job |
+| `jobs_discarded_total` | An operator discards a dead job |
+
+Gauges (state right now — query raw):
+
+| Metric | Source |
+|--------|--------|
+| `video_queue_stream_length` | `XLEN video-queue` |
+| `video_retry_zset_depth` | `ZCARD video-retry` |
+| `video_dlq_depth` | `LLEN video-dlq` |
+| `outbox_unpublished_depth` | `COUNT(*) FROM Outbox WHERE published = false` |
+
+### Why counters live in Redis
+
+The system runs as six separate processes, so an in-memory counter in a worker
+is invisible to the admin process that serves `/metrics`. Events are counted
+with `INCR` against shared Redis instead, and read back at scrape time.
+
+Counts are also not derivable from the database: a duplicate submit writes no
+row at all, a discard touches only Redis, and a redrive *resets* `retryCount`
+and `status` — erasing the evidence that the job ever failed. History only
+exists if it is recorded when it happens.
+
 ## Tech Stack
 
 | Component | Technology |
