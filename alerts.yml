@@ -1,0 +1,35 @@
+groups:
+  - name: task-queue
+    interval: 10s
+    rules:
+      # The relay is the only publisher to the stream. If it dies, SubmitJob
+      # keeps committing Job+Outbox rows but nothing reaches the workers —
+      # the queue looks healthy while no work is actually being picked up.
+      - alert: OutboxBacklogGrowing
+        expr: outbox_unpublished_depth > 10
+        for: 2m
+        labels:
+          severity: critical
+          component: relay
+        annotations:
+          summary: "Outbox backlog is {{ $value }} rows and not draining"
+          description: >-
+            Jobs are committed to Postgres but not reaching the Redis stream.
+            The relay process is most likely down or erroring.
+            Check `npm run relay` and its logs.
+
+      # A job only reaches the DLQ after exhausting all retries, so anything
+      # here has already failed FAILED_COUNT times and needs a human decision:
+      # redrive it (cause fixed) or discard it (genuinely unprocessable).
+      - alert: DeadLetterQueueNotEmpty
+        expr: video_dlq_depth > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: dlq
+        annotations:
+          summary: "{{ $value }} job(s) in the dead-letter queue"
+          description: >-
+            These jobs exhausted their retries and will not be retried
+            automatically. Inspect with `GET /dlq`, then redrive or discard
+            via the admin control plane.
