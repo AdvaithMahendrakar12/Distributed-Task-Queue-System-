@@ -82,13 +82,17 @@ const handleJob = async (messageId: string, job: VideoJob) => {
 
         await processJob(job);
 
+        try {
+            await reportResult({ jobId: job.id, status: 'completed', errorMessage: '' });
+        } catch (reportError) {
+
+            console.error(`Job ${job.id}: completed report failed — left unacked for reclaim`, reportError);
+            return;
+        }
+
         await redis.xack(STREAM_NAME, GROUP_NAME, messageId);
         await incrCounter('jobs_completed_total');
-
-        // Best-effort after ack — don't let a report failure cascade into the failure path
-        reportResult({ jobId: job.id, status: 'completed', errorMessage: '' })
-            .then(() => console.log(`Job ${job.id} completed`))
-            .catch((err) => console.error(`Job ${job.id}: failed to report completed`, err));
+        console.log(`Job ${job.id} completed`);
 
     } catch (error) {
         console.error(`Job ${job.id} failed:`, error);
